@@ -1,12 +1,15 @@
 """
 pages/6_💚_Green_Premium.py — Green Premium + BCR distributional analysis.
 
+v2: Time-series now renders for ALL granularities (Day = intraday 96-block; multi-day = daily).
+    Fixed silent failure on GP daily series via defensive dropna + try/except.
+
 For any time period (Day / Day Range / Month / Year), shows:
   - Green Premium (GP = DAM_MCP − GDAM_MCP) analysis
   - DAM BCR analysis (volume-weighted)
   - GDAM BCR analysis (volume-weighted)
 
-Each shows: time-series (if multi-day) + distribution (histogram + normal overlay) + summary stats.
+Each shows: time-series + distribution (histogram + normal overlay) + summary stats.
 """
 
 import streamlit as st
@@ -19,6 +22,7 @@ from datetime import date, timedelta
 from scipy import stats as scipy_stats
 
 from src.data_loader import load_dataframes
+from src.tools import df_blocks
 from src.green_premium import (
     GRANULARITY_LEVELS,
     resolve_period,
@@ -211,10 +215,8 @@ elif granularity == "Month":
         ss.gp_month_year = y
     months_available = year_to_months[y]
     with col_b:
-        # Build month labels
         month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         month_label_to_num = {f"{month_names[m-1]} ({m:02d})": m for m in months_available}
-        # Pick default
         default_label = next((lbl for lbl, num in month_label_to_num.items() if num == ss.gp_month_month),
                               list(month_label_to_num.keys())[-1])
         chosen_label = st.selectbox("Month", options=list(month_label_to_num.keys()),
@@ -255,14 +257,70 @@ def _fig_to_base64(fig):
 
 
 # ============================================================
-# Chart: time-series of daily values across the period
+# Chart: INTRADAY time-series (96 blocks across a single day)
+# ============================================================
+def chart_intraday_timeseries(target_date, metric_kind, label, unit, color):
+    """Plot intraday 96-block series for a single day.
+    metric_kind: 'GP' | 'DAM_BCR' | 'GDAM_BCR'
+    Reads directly from df_blocks."""
+    target = pd.to_datetime(target_date)
+    sub = df_blocks[df_blocks['Date'] == target].sort_values('Hour').reset_index(drop=True)
+    if sub.empty:
+        return None
+
+    # Build hour-of-day x-axis (0.00, 0.25, 0.50, 0.75, ..., 23.75)
+    # block index i (0-indexed) within Hour h → x = (h-1) + (i % 4) * 0.25
+    # Actually we re-derive from the row index for safety: 0,1,2,3 → 0,0.25,0.50,0.75
+    n = len(sub)
+    x_hours = np.arange(n) * 0.25  # 0, 0.25, 0.50, ..., 23.75 (when n=96)
+
+    # Pick y-values based on metric
+    if metric_kind == 'GP':
+        y = sub['GP'].values
+    elif metric_kind == 'DAM_BCR':
+        y = sub['DAM_Bid_Coverage_Ratio'].values
+    elif metric_kind == 'GDAM_BCR':
+        y = sub['GDAM_Bid_Coverage_Ratio'].values
+    else:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 3.2))
+    ax.plot(x_hours, y, color=color, linewidth=1.6, marker='o', markersize=2.5, alpha=0.85)
+
+    if metric_kind == 'GP':
+        ax.axhline(0, color='gray', linestyle='--', alpha=0.6, linewidth=0.8)
+
+    ax.set_title(f"{label} — Intraday (96 blocks)", fontsize=12, fontweight='bold')
+    ax.set_xlabel('Hour of day', fontsize=9)
+    ax.set_ylabel(f"Value ({unit})", fontsize=9)
+    ax.set_xticks([0, 3, 6, 9, 12, 15, 18, 21, 24])
+    ax.set_xlim(0, 24)
+    ax.grid(True, alpha=0.3)
+    return _fig_to_base64(fig)
+
+
+# ============================================================
+# Chart: DAILY time-series across the period (defensive)
 # ============================================================
 def chart_timeseries(daily_series, metric_name, value_key, unit, color):
     df = pd.DataFrame(daily_series)
-    if df.empty or value_key not in df.columns:
+    if df.empty:
         return None
+    if 'Date' not in df.columns or value_key not in df.columns:
+        return None
+
+    # Defensive: handle Python date OR pandas timestamp OR string
+    try:
+        df['Date'] = pd.to_datetime(df['Date'])
+    except Exception:
+        return None
+
+    # Drop rows with NaN y-values to prevent silent plot failures
+    df = df.dropna(subset=[value_key])
+    if df.empty:
+        return None
+
     fig, ax = plt.subplots(figsize=(10, 3.2))
-    df['Date'] = pd.to_datetime(df['Date'])
     df_sorted = df.sort_values('Date').reset_index(drop=True)
     ax.plot(df_sorted['Date'], df_sorted[value_key],
             color=color, linewidth=1.8, marker='o', markersize=3, alpha=0.85)
@@ -360,8 +418,13 @@ def render_stats_cards(stats, unit, headline_key=None, headline_label=None):
 # ============================================================
 # Render one metric's full analysis
 # ============================================================
-def render_metric_analysis(analysis, metric_name, unit, color, granularity, log_scale=False, headline_key=None, headline_label=None):
-    """Render time-series (if multi-day) + distribution + stats for one metric."""
+def render_metric_analysis(analysis, metric_name, unit, color, granularity, start_date,
+                           log_scale=False, headline_key=None, headline_label=None):
+    """Render time-series + distribution + stats for one metric.
+
+    For 'Day' granularity → intraday 96-block plot.
+    For Day Range / Month / Year → daily time-series.
+    """
 
     if 'error' in analysis:
         st.error(f"{metric_name}: {analysis['error']}")
@@ -375,19 +438,31 @@ def render_metric_analysis(analysis, metric_name, unit, color, granularity, log_
     </div>
     """, unsafe_allow_html=True)
 
-    # Time-series (only if multi-day)
-    if granularity != "Day":
-        ts_key = "gp_mean" if "GP" in metric_name else "bcr_vol_wt"
+    # --- TIME-SERIES (always shown, format depends on granularity) ---
+    if granularity == "Day":
+        # Determine metric kind for intraday plot
+        if "GP" in metric_name or "Green Premium" in metric_name:
+            metric_kind = "GP"
+        elif "GDAM" in metric_name:
+            metric_kind = "GDAM_BCR"
+        else:
+            metric_kind = "DAM_BCR"
+        ts_b64 = chart_intraday_timeseries(start_date, metric_kind, metric_name, unit, color)
+        if ts_b64:
+            st.markdown(f'<img src="data:image/png;base64,{ts_b64}" style="width:100%;margin-bottom:8px;"/>', unsafe_allow_html=True)
+    else:
+        # Multi-day: daily time-series
+        ts_key = "gp_mean" if ("GP" in metric_name or "Green Premium" in metric_name) else "bcr_vol_wt"
         ts_b64 = chart_timeseries(analysis['daily_series'], metric_name, ts_key, unit, color)
         if ts_b64:
             st.markdown(f'<img src="data:image/png;base64,{ts_b64}" style="width:100%;margin-bottom:8px;"/>', unsafe_allow_html=True)
 
-    # Distribution
+    # --- DISTRIBUTION ---
     dist_b64 = chart_distribution(analysis['distribution'], metric_name, unit, color, log_scale=log_scale)
     if dist_b64:
         st.markdown(f'<img src="data:image/png;base64,{dist_b64}" style="width:100%;margin-bottom:8px;"/>', unsafe_allow_html=True)
 
-    # Stats cards
+    # --- STATS ---
     render_stats_cards(analysis['aggregate_stats'], unit, headline_key=headline_key, headline_label=headline_label)
 
 
@@ -430,6 +505,7 @@ if ss.gp_last_result is not None:
         "₹/kWh",
         color='#2E8B57',
         granularity=r['granularity'],
+        start_date=r['start_date'],
         log_scale=False,
     )
 
@@ -439,6 +515,7 @@ if ss.gp_last_result is not None:
         "x (ratio)",
         color='#1F3864',
         granularity=r['granularity'],
+        start_date=r['start_date'],
         log_scale=r['log_scale'],
         headline_key='mean_volume_weighted',
         headline_label='VOL-WEIGHTED',
@@ -450,6 +527,7 @@ if ss.gp_last_result is not None:
         "x (ratio)",
         color='#4A90E2',
         granularity=r['granularity'],
+        start_date=r['start_date'],
         log_scale=r['log_scale'],
         headline_key='mean_volume_weighted',
         headline_label='VOL-WEIGHTED',
@@ -463,7 +541,7 @@ else:
     - **DAM Bid Coverage Ratio** = sum(DAM Sell Bids) / sum(DAM Buy Bids). Volume-weighted at the aggregate level.
     - **GDAM Bid Coverage Ratio** = sum(GDAM Sell Bids) / sum(GDAM Buy Bids). Same formula, green market.
 
-    Each analysis includes (when multi-day): daily time-series + block-level distribution with normal-fit overlay + summary stats (mean, median, std, P10, P50, P90, min, max).
+    Each analysis includes: time-series (intraday for Day; daily for multi-day periods) + block-level distribution with normal-fit overlay + summary stats.
     """)
 
 
@@ -483,6 +561,7 @@ with st.sidebar:
     - **Distribution charts** show empirical histogram + KDE + fitted normal curve overlay
     - **Real-world distributions** (especially BCR) are non-normal — the fit shows you how far off the data is from "normal"
     - **Log scale** for BCR helps when distribution is right-skewed
+    - **Time-series**: intraday 96-block plot for single Day; daily series for multi-day periods
     """)
 
     st.markdown("---")
